@@ -1,3 +1,4 @@
+from scipy import rand
 import tensorflow as tf
 import tensorflow.keras.backend as K
 from tensorflow.keras import layers, models
@@ -9,7 +10,7 @@ import random
 import json
 import math
 import pandas as pd
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, Callback
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input
@@ -19,6 +20,11 @@ from tensorflow.keras.optimizers.schedules import ExponentialDecay
 import inception_naive
 import inception_v1
 
+def euclidean_distance(vects):
+    x, y = vects
+    sum_square = tf.math.reduce_sum(tf.math.square(x - y), axis=1, keepdims=True)
+    return tf.math.sqrt(tf.math.maximum(sum_square, tf.keras.backend.epsilon()))
+
 def RMSE(vectors):
     (featsA, featsB) = vectors
     mean = kerasBackend.sqrt(kerasBackend.mean(kerasBackend.square(featsA - featsB), axis=1,keepdims=True))
@@ -27,26 +33,24 @@ def RMSE(vectors):
 def generate_inception_model():
     sig = layers.Input(shape=(1000, 12, 1))
     ref = layers.Input(shape=(1000, 12, 1))
+    model_input = layers.Input(shape=(1000, 12, 1))
 
-    sig_model = inception_v1.sister_functional_generation(sig)
-    ref_model = inception_v1.sister_functional_generation(ref)
+    backbone = inception_v1.sister_functional_generation(model_input)
+    sig_model = backbone(sig)
+    ref_model = backbone(ref)
 
     # Definir a distância
     distance = layers.Lambda(RMSE)([sig_model, ref_model])
     # L1_layer = Lambda(lambda tensors: K.abs(tensors[0] - tensors[1]))
     # distance = L1_layer([sig_model, ref_model])
 
-    outputs = layers.Dense(1, activation="sigmoid")(distance)
+    normalization = tf.keras.layers.BatchNormalization()(distance)
+    outputs = layers.Dense(1, activation="sigmoid")(normalization)
     siamese_model = models.Model(inputs=[sig, ref], outputs=outputs)
 
     return siamese_model
 
 def contrastive_loss(y_true, y_pred, margin=1):
-    # y = tf.cast(y, preds.dtype)
-    # squaredPreds = kerasBackend.square(preds)
-    # squaredMargin = kerasBackend.square(kerasBackend.maximum(margin - preds, 0))
-    # loss = kerasBackend.mean((1 - y) * squaredPreds + (y) * squaredMargin)
-    # return loss
     y_true = tf.cast(y_true, y_pred.dtype)
     square_pred = tf.math.square(y_pred)
     margin_square = tf.math.square(tf.math.maximum(margin - (y_pred), 0))
@@ -55,9 +59,8 @@ def contrastive_loss(y_true, y_pred, margin=1):
     )
 
 class CustomDataGen(tf.keras.utils.Sequence):
-
     def __init__(self, data_x, data_y,
-                 batch_size,
+                 batch_size, training=True,
                  input_size=(1000, 12, 1),
                  shuffle=True):
 
@@ -71,9 +74,21 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.input_size = input_size
         self.shuffle = shuffle
         self.n = data_y.shape[0]
-        self.on_epoch_end()
+        self.training = training
+        
+    def augment(self, entry):
+        return entry
+        possible_increment = [float(i/10) for i in range(-10, 10)]
+        increment = random.choice(possible_increment)
+        entry += increment
 
-    def on_epoch_end(self): # shuffled positive and negative pairs
+        possible_shift = [i for i in range(-30, 30)]
+        shift = random.choice(possible_shift)
+        entry = np.roll(entry, shift, axis=0)
+        return entry
+
+
+    def shuffle_data(self): # shuffled positive and negative pairs
         print('shuffling data...')
         aux_x1 = []
         aux_x2 = []
@@ -86,15 +101,18 @@ class CustomDataGen(tf.keras.utils.Sequence):
 
             for i in range(positive_x.shape[0]):
                 # create positive pair
-                aux_x1.append(positive_x[i].copy())
                 random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                aux_x2.append(positive_x[random_idx].copy())
+                aux_x1.append(self.augment(positive_x[random_idx].copy()))
+                random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
+                aux_x2.append(self.augment(positive_x[random_idx].copy()))
                 aux_y.append(1.0)
 
+                # if not self.training:
                 # create negative pair
-                aux_x1.append(positive_x[i].copy())
+                random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
+                aux_x1.append(self.augment(positive_x[random_idx].copy()))
                 random_idx = random.sample(range(negative_x.shape[0]), 1)[0]
-                aux_x2.append(negative_x[random_idx].copy())
+                aux_x2.append(self.augment(negative_x[random_idx].copy()))
                 aux_y.append(0.0)
 
         self.aux_x1 = aux_x1
@@ -113,10 +131,21 @@ class CustomDataGen(tf.keras.utils.Sequence):
         batch_x2 = np.array(self.aux_x2[index * self.batch_size:(index + 1) * self.batch_size])
         batch_y = np.array(self.aux_y[index * self.batch_size:(index + 1) * self.batch_size])
         X, y = self.__get_data(batch_x1, batch_x2, batch_y)
+
         return X, y
 
     def __len__(self):
         return self.n // self.batch_size
+
+class ReshuffleDataCallback(Callback):
+    def __init__(self, train_generator, validation_generator):
+        super().__init__()
+        self.train_generator = train_generator
+        self.validation_generator = validation_generator
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.train_generator.shuffle_data()
+        self.validation_generator.shuffle_data()
 
 def get_lr_metric(optimizer):
     def lr(y_true, y_pred):
@@ -124,15 +153,15 @@ def get_lr_metric(optimizer):
     return lr
 
 def train_model():
-    batch_size = 8
+    batch_size = 64
     num_epochs = 30
-    steps = int(((9794+1111)/batch_size)*num_epochs)
+    steps = int(((9794 + 1111)/batch_size)*num_epochs)
 
-    initial_lr = 0.01
+    initial_lr = 0.003
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         initial_lr,
         decay_steps=steps,
-        decay_rate=0.01,
+        decay_rate=0.3,
         staircase=False)
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
@@ -144,19 +173,23 @@ def train_model():
 
     train_x = np.load('x_train.npy')
     train_y = np.load('y_train.npy')
-    train_generator = CustomDataGen(train_x, train_y, batch_size)
+    train_generator = CustomDataGen(train_x, train_y, batch_size, training=True)
+    train_generator.shuffle_data()
 
     val_x = np.load('x_test.npy')
     val_y = np.load('y_test.npy')
-    validation_generator = CustomDataGen(val_x, val_y, batch_size)
+    validation_generator = CustomDataGen(val_x, val_y, batch_size, training=False)
+    validation_generator.shuffle_data()
 
-    es = EarlyStopping(monitor='val_loss', patience=5, min_delta=0.001)
+    reshuffle_data_callback = ReshuffleDataCallback(train_generator, validation_generator)
+
     mc = ModelCheckpoint(filepath='inception_v1/test4.h5', monitor='val_loss',
                          verbose=0, save_best_only=True, save_weights_only=False, mode='min', save_freq='epoch')
 
-    history = model.fit_generator(train_generator,
-                                  validation_data=validation_generator,
-                                  epochs=num_epochs, callbacks=[mc], verbose=1, workers=1, use_multiprocessing=False)
+    model.summary()
+
+    history = model.fit(train_generator, validation_data=validation_generator, epochs=num_epochs, 
+                        callbacks=[mc, reshuffle_data_callback])
 
     pd.DataFrame.from_dict(history.history).to_excel('inception_v1/history4.xlsx', index=False)
 
