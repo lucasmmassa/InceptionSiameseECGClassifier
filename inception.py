@@ -15,14 +15,17 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, concatenate, Input, Dense, Flatten, SpatialDropout2D, Lambda
 from tensorflow.keras.utils import plot_model
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+import inception_naive
+import inception_v1
 
 def inception_module(layer_in, f1, f2, f3):
     # 1x1 conv
     conv1 = Conv2D(f1, (1,1), padding='same', activation='relu')(layer_in)
     # 3x3 conv
-    conv3 = Conv2D(f2, (1,3), padding='same', activation='relu')(layer_in)
+    conv3 = Conv2D(f2, (3,3), padding='same', activation='relu')(layer_in)
     # 5x5 conv
-    conv5 = Conv2D(f3, (1,5), padding='same', activation='relu')(layer_in)
+    conv5 = Conv2D(f3, (5,5), padding='same', activation='relu')(layer_in)
     # 3x3 max pooling
     # pool = MaxPooling2D((2,2), strides=(1,1), padding='same')(layer_in)
     # concatenate filters, assumes filters/channels last
@@ -30,19 +33,21 @@ def inception_module(layer_in, f1, f2, f3):
     return layer_out
 
 def sister_functional_generation(input_layer):
-    inception1 = inception_module(input_layer, 128, 128, 128)
-    # inception2 = inception_module(inception1, 128, 128, 128)
+    inception1 = inception_module(input_layer, 64, 128, 128)
+    inception2 = inception_module(inception1, 128, 128, 128)
     # drop1 = SpatialDropout2D(0.2)(inception2)
-    pool1 = MaxPooling2D(pool_size=(2, 2))(inception1)
+    pool1 = MaxPooling2D(pool_size=(2, 2))(inception2)
     inception3 = inception_module(pool1, 64, 64, 64)
-    # inception4 = inception_module(inception3, 64, 64, 64)
+    inception4 = inception_module(inception3, 64, 64, 64)
     # drop2 = SpatialDropout2D(0.2)(inception4)
-    pool2 = MaxPooling2D(pool_size=(2, 2))(inception3)
-    flat = Flatten()(pool2)
-    return flat
+    pool2 = MaxPooling2D(pool_size=(2, 2))(inception4)
     inception5 = inception_module(pool2, 64, 64, 64)
     inception6 = inception_module(inception5, 64, 64, 64)
     pool3 = MaxPooling2D(pool_size=(2, 2))(inception6)
+    # inception7 = inception_module(pool3, 32, 32, 32)
+    # inception8 = inception_module(inception7, 32, 32, 32)
+    flat = Flatten()(pool3)
+    return flat
 
 def RMSE(vectors):
     (featsA, featsB) = vectors
@@ -53,8 +58,8 @@ def generate_inception_model():
     sig = layers.Input(shape=(1000, 12, 1))
     ref = layers.Input(shape=(1000, 12, 1))
 
-    sig_model = sister_functional_generation(sig)
-    ref_model = sister_functional_generation(ref)
+    sig_model = inception_v1.sister_functional_generation(sig)
+    ref_model = inception_v1.sister_functional_generation(ref)
 
     # Definir a distância
     distance = layers.Lambda(RMSE)([sig_model, ref_model])
@@ -143,14 +148,29 @@ class CustomDataGen(tf.keras.utils.Sequence):
     def __len__(self):
         return self.n // self.batch_size
 
-def train_model():
-    model = generate_inception_model()
-    model.compile(loss='binary_crossentropy', optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                  metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall(),
-                           tf.keras.metrics.TrueNegatives(), tf.keras.metrics.FalseNegatives(),
-                           tf.keras.metrics.TruePositives(), tf.keras.metrics.FalsePositives()])
+def get_lr_metric(optimizer):
+    def lr(y_true, y_pred):
+        return optimizer._decayed_lr(tf.float32) # I use ._decayed_lr method instead of .lr
+    return lr
 
-    batch_size = 16
+def train_model():
+    batch_size = 8
+    num_epochs = 30
+    steps = int(((9794+1111)/batch_size)*num_epochs)
+
+    initial_lr = 0.01
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_lr,
+        decay_steps=steps,
+        decay_rate=0.01,
+        staircase=False)
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    lr_metric = get_lr_metric(optimizer)
+
+    model = generate_inception_model()
+    model.compile(loss=contrastive_loss, optimizer=optimizer,
+                  metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), lr_metric])
 
     train_x = np.load('x_train.npy')
     train_y = np.load('y_train.npy')
@@ -160,15 +180,15 @@ def train_model():
     val_y = np.load('y_test.npy')
     validation_generator = CustomDataGen(val_x, val_y, batch_size)
 
-    es = EarlyStopping(monitor='val_loss', patience=5, min_delta=0.01)
-    mc = ModelCheckpoint(filepath='test.h5', monitor='val_loss',
+    es = EarlyStopping(monitor='val_loss', patience=5, min_delta=0.001)
+    mc = ModelCheckpoint(filepath='inception_v1/test4.h5', monitor='val_loss',
                          verbose=0, save_best_only=True, save_weights_only=False, mode='min', save_freq='epoch')
 
     history = model.fit_generator(train_generator,
                                   validation_data=validation_generator,
-                                  epochs=5, callbacks=[es, mc], verbose=1, workers=1, use_multiprocessing=False)
+                                  epochs=num_epochs, callbacks=[mc], verbose=1, workers=1, use_multiprocessing=False)
 
-    pd.DataFrame.from_dict(history.history).to_excel('history.xlsx', index=False)
+    pd.DataFrame.from_dict(history.history).to_excel('inception_v1/history4.xlsx', index=False)
 
 def test():
     model = generate_inception_model()
