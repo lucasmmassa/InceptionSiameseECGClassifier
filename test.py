@@ -12,12 +12,20 @@ print(X_test.shape)
 print(y_test.shape)
 print(X_test.dtype)
 
+valid_labels = ['CD', 'NORM', 'CD-MI', 'MI', 'STTC']
+
 aux = []
 y1 = []
+
 for i in range(y_train.shape[0]):
     if len(y_train[i]) == 1:
+        label = y_train[i][0]
+    elif len(y_train[i]) > 1:
+        label = '-'.join(y_train[i])
+
+    if label in valid_labels:
         aux.append(i)
-        y1.append(y_train[i][0])
+        y1.append(label)
 
 y1 = np.array(y1)
 x1 = X_train[aux]
@@ -26,11 +34,42 @@ aux = []
 y2 = []
 for i in range(y_test.shape[0]):
     if len(y_test[i]) == 1:
+        label = y_test[i][0]
+    elif len(y_test[i]) > 1:
+        label = '-'.join(y_test[i])
+
+    if label in valid_labels:
         aux.append(i)
-        y2.append(y_test[i][0])
+        y2.append(label)
 
 y2 = np.array(y2)
 x2 = X_test[aux]
+
+aux = y1 == 'NORM'
+norm_y = y1[aux]
+rest_y = y1[~aux]
+norm_x = x1[aux]
+rest_x = x1[~aux]
+
+l = norm_y.shape[0]
+norm_x = norm_x[:int(0.3*l)]
+norm_y = norm_y[:int(0.3*l)]
+
+x1 = np.vstack([norm_x, rest_x])
+y1 = np.hstack([norm_y, rest_y])
+
+aux = y2 == 'NORM'
+norm_y = y2[aux]
+rest_y = y2[~aux]
+norm_x = x2[aux]
+rest_x = x2[~aux]
+
+l = norm_y.shape[0]
+norm_x = norm_x[:int(0.3*l)]
+norm_y = norm_y[:int(0.3*l)]
+
+x2 = np.vstack([norm_x, rest_x])
+y2 = np.hstack([norm_y, rest_y])
 
 print(x1.shape)
 print(y1.shape)
