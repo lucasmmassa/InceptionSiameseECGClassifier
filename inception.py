@@ -35,7 +35,7 @@ def generate_inception_model():
     ref = layers.Input(shape=(1000, 12, 1))
     model_input = layers.Input(shape=(1000, 12, 1))
 
-    backbone = inception_v1.sister_functional_generation(model_input)
+    backbone = Model(model_input, inception_v1.sister_functional_generation(model_input))
     sig_model = backbone(sig)
     ref_model = backbone(ref)
 
