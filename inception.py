@@ -3,22 +3,26 @@ import tensorflow as tf
 import tensorflow.keras.backend as K
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as kerasBackend
-from tensorflow.keras.utils import Sequence
-from joblib import Parallel, delayed, parallel
+
+from tensorflow.keras.callbacks import ModelCheckpoint, Callback
+from tensorflow.keras.utils import plot_model
+from tensorflow.keras.models import Model
+import inception_naive
+import inception_v1
+import pandas as pd
 import numpy as np
 import random
 import json
 import math
-import pandas as pd
-from tensorflow.keras.callbacks import ModelCheckpoint, Callback
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, concatenate, Input, Dense, Flatten, SpatialDropout2D, Lambda
-from tensorflow.keras.utils import plot_model
-from tensorflow.keras.optimizers.schedules import ExponentialDecay
-import inception_naive
-import inception_v1
+import os
+
+tf.keras.backend.set_floatx('float16')
+DRIVE_PATH = ""
+
+def get_asset(path):
+    if DRIVE_PATH == "":
+        return path
+    return os.path.join(DRIVE_PATH, path)
 
 def euclidean_distance(vects):
     x, y = vects
@@ -38,6 +42,7 @@ def generate_inception_model():
     backbone = Model(model_input, inception_v1.sister_functional_generation(model_input))
     sig_model = backbone(sig)
     ref_model = backbone(ref)
+    # backbone.summary()
 
     # Definir a distância
     distance = layers.Lambda(RMSE)([sig_model, ref_model])
@@ -77,16 +82,14 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.training = training
         
     def augment(self, entry):
-        return entry
-        possible_increment = [float(i/10) for i in range(-10, 10)]
-        increment = random.choice(possible_increment)
-        entry += increment
+        # possible_increment = [float(i/10) for i in range(-10, 10)]
+        # increment = random.choice(possible_increment)
+        # entry += increment
 
-        possible_shift = [i for i in range(-30, 30)]
-        shift = random.choice(possible_shift)
-        entry = np.roll(entry, shift, axis=0)
+        # possible_shift = [i for i in range(-30, 30)]
+        # shift = random.choice(possible_shift)
+        # entry = np.roll(entry, shift, axis=0)
         return entry
-
 
     def shuffle_data(self): # shuffled positive and negative pairs
         print('shuffling data...')
@@ -100,37 +103,38 @@ class CustomDataGen(tf.keras.utils.Sequence):
             negative_x = self.data_x[~indexes]
 
             for i in range(positive_x.shape[0]):
-                # create positive pair
-                random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                aux_x1.append(self.augment(positive_x[random_idx].copy()))
-                random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                aux_x2.append(self.augment(positive_x[random_idx].copy()))
-                aux_y.append(1.0)
-
-                # if not self.training:
-                # create negative pair
-                random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                aux_x1.append(self.augment(positive_x[random_idx].copy()))
-                random_idx = random.sample(range(negative_x.shape[0]), 1)[0]
-                aux_x2.append(self.augment(negative_x[random_idx].copy()))
-                aux_y.append(0.0)
+                is_positive_pair = random.choice([0, 1])
+                if is_positive_pair == 1:
+                    random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
+                    aux_x1.append(self.augment(positive_x[random_idx].copy()))
+                    random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
+                    aux_x2.append(self.augment(positive_x[random_idx].copy()))
+                else:                    
+                    random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
+                    aux_x1.append(self.augment(positive_x[random_idx].copy()))
+                    random_idx = random.sample(range(negative_x.shape[0]), 1)[0]
+                    aux_x2.append(self.augment(negative_x[random_idx].copy()))
+                
+                aux_y.append(float(is_positive_pair))
 
         self.aux_x1 = aux_x1
         self.aux_x2 = aux_x2
         self.aux_y = aux_y
         print('finished.\n')
 
-    def __get_data(self, batch_x1, batch_x2, batch_y):
-        x1 = batch_x1.reshape(self.batch_size, 1000, 12, 1)
-        x2 = batch_x2.reshape(self.batch_size, 1000, 12, 1)
-        y = np.array(batch_y, dtype=int)
-        return ([x1, x2], y)
-
-    def __getitem__(self, index):
+    def prepare_batch(self, index):
         batch_x1 = np.array(self.aux_x1[index * self.batch_size:(index + 1) * self.batch_size])
         batch_x2 = np.array(self.aux_x2[index * self.batch_size:(index + 1) * self.batch_size])
         batch_y = np.array(self.aux_y[index * self.batch_size:(index + 1) * self.batch_size])
-        X, y = self.__get_data(batch_x1, batch_x2, batch_y)
+        
+        batch_x1 = batch_x1.reshape(self.batch_size, 1000, 12, 1)
+        batch_x2 = batch_x2.reshape(self.batch_size, 1000, 12, 1)
+        batch_y = np.array(batch_y, dtype=int)
+
+        return ([batch_x1, batch_x2], batch_y)
+
+    def __getitem__(self, index):
+        X, y = self.prepare_batch(index)
 
         return X, y
 
@@ -153,7 +157,7 @@ def get_lr_metric(optimizer):
     return lr
 
 def train_model():
-    batch_size = 64
+    batch_size = 32
     num_epochs = 30
     steps = int(((9794 + 1111)/batch_size)*num_epochs)
 
@@ -171,13 +175,13 @@ def train_model():
     model.compile(loss=contrastive_loss, optimizer=optimizer,
                   metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), lr_metric])
 
-    train_x = np.load('x_train.npy')
-    train_y = np.load('y_train.npy')
+    train_x = np.load(get_asset('x_train.npy'))
+    train_y = np.load(get_asset('y_train.npy'))
     train_generator = CustomDataGen(train_x, train_y, batch_size, training=True)
     train_generator.shuffle_data()
 
-    val_x = np.load('x_test.npy')
-    val_y = np.load('y_test.npy')
+    val_x = np.load(get_asset('x_test.npy'))
+    val_y = np.load(get_asset('y_test.npy'))
     validation_generator = CustomDataGen(val_x, val_y, batch_size, training=False)
     validation_generator.shuffle_data()
 
