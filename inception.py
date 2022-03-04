@@ -1,14 +1,17 @@
-from scipy import rand
-import tensorflow as tf
-import tensorflow.keras.backend as K
-from tensorflow.keras import layers, models
-from tensorflow.keras import backend as kerasBackend
-
 from tensorflow.keras.callbacks import ModelCheckpoint, Callback
+from tensorflow.keras import backend as kerasBackend
 from tensorflow.keras.utils import plot_model
+from tensorflow.keras import layers, models
 from tensorflow.keras.models import Model
+import tensorflow.keras.backend as K
+import tensorflow as tf
+
+
 import inception_naive
 import inception_v1
+
+from scipy import rand
+from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import random
@@ -49,8 +52,8 @@ def generate_inception_model():
     # L1_layer = Lambda(lambda tensors: K.abs(tensors[0] - tensors[1]))
     # distance = L1_layer([sig_model, ref_model])
 
-    normalization = tf.keras.layers.BatchNormalization()(distance)
-    outputs = layers.Dense(1, activation="sigmoid")(normalization)
+    # normalization = tf.keras.layers.BatchNormalization()(distance)
+    outputs = layers.Dense(1, activation="sigmoid")(distance)
     siamese_model = models.Model(inputs=[sig, ref], outputs=outputs)
 
     return siamese_model
@@ -64,22 +67,21 @@ def contrastive_loss(y_true, y_pred, margin=1):
     )
 
 class CustomDataGen(tf.keras.utils.Sequence):
-    def __init__(self, data_x, data_y,
-                 batch_size, training=True,
-                 input_size=(1000, 12, 1),
-                 shuffle=True):
+    def __init__(self, X, y,
+                 batch_size,
+                 input_size=(1000, 12, 1)):
+        self.X = X
+        self.y = y
+        self.possible_labels = np.unique(y)
+        
+        self.reference_entry = None
+        self.inference_entry = None
+        self.labels = None
 
-        self.data_x = data_x
-        self.data_y = data_y
-        self.possible_labels = np.unique(data_y)
-        self.aux_x1 = None
-        self.aux_x2 = None
-        self.aux_y = None
+        self.batch_index = 0
         self.batch_size = batch_size
         self.input_size = input_size
-        self.shuffle = shuffle
-        self.n = data_y.shape[0]
-        self.training = training
+        self.dataset_size = y.shape[0]
         
     def augment(self, entry):
         # possible_increment = [float(i/10) for i in range(-10, 10)]
@@ -93,53 +95,52 @@ class CustomDataGen(tf.keras.utils.Sequence):
 
     def shuffle_data(self): # shuffled positive and negative pairs
         print('shuffling data...')
-        aux_x1 = []
-        aux_x2 = []
-        aux_y = []
+        reference_entry = []
+        inference_entry = []
+        labels = []
 
-        for label in self.possible_labels:
-            indexes = self.data_y == label
-            positive_x = self.data_x[indexes]
-            negative_x = self.data_x[~indexes]
+        indexes = np.array([i for i in range(self.dataset_size)])
+        np.random.shuffle(indexes)
 
-            for i in range(positive_x.shape[0]):
-                is_positive_pair = random.choice([0, 1])
-                if is_positive_pair == 1:
-                    random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                    aux_x1.append(self.augment(positive_x[random_idx].copy()))
-                    random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                    aux_x2.append(self.augment(positive_x[random_idx].copy()))
-                else:                    
-                    random_idx = random.sample(range(positive_x.shape[0]), 1)[0]
-                    aux_x1.append(self.augment(positive_x[random_idx].copy()))
-                    random_idx = random.sample(range(negative_x.shape[0]), 1)[0]
-                    aux_x2.append(self.augment(negative_x[random_idx].copy()))
-                
-                aux_y.append(float(is_positive_pair))
+        similar_samples = {}
+        different_samples = {}
 
-        self.aux_x1 = aux_x1
-        self.aux_x2 = aux_x2
-        self.aux_y = aux_y
+        for l in self.possible_labels:
+            similar_samples[l] = self.X[self.y == l]
+            different_samples[l] = self.X[self.y != l]
+        
+        for index in tqdm(indexes):
+            current_label = self.y[index]
+
+            reference_entry.append(self.augment(self.X[index].copy()))
+            inference_entry.append(random.choice(similar_samples[current_label]).copy())
+            labels.append(1.0)
+
+            reference_entry.append(self.augment(self.X[index].copy()))
+            inference_entry.append(random.choice(different_samples[current_label]).copy())                
+            labels.append(0.0)
+
+        self.reference_entry = np.array_split(reference_entry, self.__len__() + 1)
+        self.inference_entry = np.array_split(inference_entry, self.__len__() + 1)
+        self.labels = np.array_split(labels, self.__len__() + 1)
+        self.batch_index = 0
         print('finished.\n')
 
     def prepare_batch(self, index):
-        batch_x1 = np.array(self.aux_x1[index * self.batch_size:(index + 1) * self.batch_size])
-        batch_x2 = np.array(self.aux_x2[index * self.batch_size:(index + 1) * self.batch_size])
-        batch_y = np.array(self.aux_y[index * self.batch_size:(index + 1) * self.batch_size])
-        
-        batch_x1 = batch_x1.reshape(self.batch_size, 1000, 12, 1)
-        batch_x2 = batch_x2.reshape(self.batch_size, 1000, 12, 1)
-        batch_y = np.array(batch_y, dtype=int)
+        batch_x1 = self.reference_entry[index]
+        batch_x2 = self.inference_entry[index]
+        batch_y = self.labels[index].astype(int)
 
         return ([batch_x1, batch_x2], batch_y)
 
     def __getitem__(self, index):
-        X, y = self.prepare_batch(index)
+        X, y = self.prepare_batch(self.batch_index)
+        self.batch_index += 1
 
         return X, y
 
     def __len__(self):
-        return self.n // self.batch_size
+        return self.dataset_size // self.batch_size
 
 class ReshuffleDataCallback(Callback):
     def __init__(self, train_generator, validation_generator):
@@ -157,11 +158,22 @@ def get_lr_metric(optimizer):
     return lr
 
 def train_model():
-    batch_size = 32
+    batch_size = 8
     num_epochs = 30
-    steps = int(((9794 + 1111)/batch_size)*num_epochs)
 
-    initial_lr = 0.003
+    train_x = np.load(get_asset('x_train.npy'))
+    train_y = np.load(get_asset('y_train.npy'))
+    train_generator = CustomDataGen(train_x, train_y, batch_size)
+    train_generator.shuffle_data()
+
+    val_x = np.load(get_asset('x_test.npy'))
+    val_y = np.load(get_asset('y_test.npy'))
+    validation_generator = CustomDataGen(val_x, val_y, batch_size)
+    validation_generator.shuffle_data()
+
+    steps = int(((train_y.shape[0] + val_y.shape[0])/batch_size) * num_epochs)
+
+    initial_lr = 0.01
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         initial_lr,
         decay_steps=steps,
@@ -174,16 +186,6 @@ def train_model():
     model = generate_inception_model()
     model.compile(loss=contrastive_loss, optimizer=optimizer,
                   metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), lr_metric])
-
-    train_x = np.load(get_asset('x_train.npy'))
-    train_y = np.load(get_asset('y_train.npy'))
-    train_generator = CustomDataGen(train_x, train_y, batch_size, training=True)
-    train_generator.shuffle_data()
-
-    val_x = np.load(get_asset('x_test.npy'))
-    val_y = np.load(get_asset('y_test.npy'))
-    validation_generator = CustomDataGen(val_x, val_y, batch_size, training=False)
-    validation_generator.shuffle_data()
 
     reshuffle_data_callback = ReshuffleDataCallback(train_generator, validation_generator)
 
